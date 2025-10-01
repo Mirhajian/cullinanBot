@@ -2,7 +2,6 @@ from flask import Flask, request, jsonify
 import requests
 from bs4 import BeautifulSoup
 import base64
-import io
 from urllib.parse import urljoin
 
 app = Flask(__name__)
@@ -34,8 +33,8 @@ def find_captcha_info(html):
     captcha_input = soup.find("input", {"name": "txtCaptcha"})
     if not captcha_input:
         return None
+    
     # تلاش برای یافتن تگ img مرتبط
-    img = None
     img = soup.find("img", id=lambda x: x and "captcha" in x.lower()) or \
           soup.find("img", src=lambda x: x and "captcha" in x.lower())
     
@@ -61,10 +60,9 @@ def fetch_captcha_image(session, img_src):
         if r.status_code == 200:
             data = r.content
             b64 = base64.b64encode(data).decode('ascii')
-            # تشخیص نوع تصویر از content-type یا داده
+            # تشخیص نوع تصویر
             content_type = r.headers.get("Content-Type", "")
             if not content_type or content_type == "application/octet-stream":
-                # تلاش برای تشخیص از magic bytes
                 if data[:4] == b'\x89PNG':
                     content_type = "image/png"
                 elif data[:3] == b'GIF':
@@ -72,12 +70,26 @@ def fetch_captcha_image(session, img_src):
                 elif data[:2] == b'\xff\xd8':
                     content_type = "image/jpeg"
                 else:
-                    content_type = "image/png"  # پیش‌فرض
+                    content_type = "image/png"
             return "data:{};base64,{}".format(content_type, b64)
     except Exception as e:
         print(f"Error fetching captcha: {e}")
         return None
     return None
+
+def is_logged_in(url, html):
+    """چک کردن اینکه آیا لاگین موفق بوده"""
+    # URL های موفقیت
+    success_urls = ["Reservation.aspx", "ChangePassword.aspx", "MyCullinan"]
+    for success_url in success_urls:
+        if success_url in url:
+            return True
+    
+    # اگر در HTML صفحه لاگین نباشیم
+    if "txtUsername" not in html and "txtPassword" not in html:
+        return True
+    
+    return False
 
 def attempt_login(username, password):
     session = requests.Session()
@@ -129,13 +141,14 @@ def attempt_login(username, password):
     debug['login_post_status'] = r2.status_code
     debug['login_post_url'] = r2.url
 
-    if "Reservation.aspx" in r2.url or "Reservation" in r2.url:
-        # لاگین موفق - ذخیره session
+    # چک موفقیت لاگین
+    if is_logged_in(r2.url, r2.text):
         user_sessions[username] = {
             "session": session,
             "hidden": {},
             "password": password
         }
+        debug['login_success'] = True
         return session, debug
 
     # چک مجدد کپچا
@@ -144,7 +157,6 @@ def attempt_login(username, password):
         debug['has_captcha_after_post'] = True
         if captcha_after.get("img_src"):
             debug['captcha_img_after'] = fetch_captcha_image(session, captcha_after["img_src"])
-        # ذخیره hidden fields جدید
         user_sessions[username] = {
             "session": session,
             "hidden": get_hidden_fields(r2.text),
@@ -155,23 +167,27 @@ def attempt_login(username, password):
     return None, debug
 
 def get_all_menus(session):
-    r = session.get(RESERVE_URL, timeout=15)
-    soup = BeautifulSoup(r.text, "html.parser")
-    menus = []
-    tables = soup.select("table.GridView")
-    for tbl in tables:
-        title_el = tbl.find_previous("span") or tbl.find_previous("h3")
-        title = title_el.get_text(strip=True) if title_el else "سلف ناشناخته"
+    try:
+        r = session.get(RESERVE_URL, timeout=15)
+        soup = BeautifulSoup(r.text, "html.parser")
+        menus = []
+        tables = soup.select("table.GridView")
+        for tbl in tables:
+            title_el = tbl.find_previous("span") or tbl.find_previous("h3")
+            title = title_el.get_text(strip=True) if title_el else "سلف ناشناخته"
 
-        rows = tbl.find_all("tr")
-        foods = []
-        for row in rows:
-            cols = [c.get_text(strip=True) for c in row.find_all("td")]
-            if cols:
-                foods.append(" | ".join(cols))
-        if foods:
-            menus.append({"title": title, "foods": foods})
-    return menus
+            rows = tbl.find_all("tr")
+            foods = []
+            for row in rows:
+                cols = [c.get_text(strip=True) for c in row.find_all("td")]
+                if cols:
+                    foods.append(" | ".join(cols))
+            if foods:
+                menus.append({"title": title, "foods": foods})
+        return menus
+    except Exception as e:
+        print(f"Error getting menus: {e}")
+        return []
 
 @app.route("/menu", methods=["GET"])
 def menu():
@@ -202,7 +218,12 @@ def menu():
 
     # لاگین موفق
     menus = get_all_menus(session)
-    return jsonify({"ok": True, "menus": menus, "debug": debug})
+    if menus:
+        return jsonify({"ok": True, "menus": menus, "debug": debug})
+    else:
+        # لاگین موفق ولی منو نیست - ممکن است تغییر رمز لازم باشد
+        debug['warning'] = 'Login succeeded but no menus found. May need password change.'
+        return jsonify({"ok": True, "menus": [], "debug": debug})
 
 @app.route("/captcha", methods=["POST"])
 def solve_captcha():
@@ -250,15 +271,31 @@ def solve_captcha():
         "final_url": r2.url
     }
     
-    if "Reservation.aspx" in r2.url or "Reservation" in r2.url:
+    # چک موفقیت لاگین با تابع جدید
+    if is_logged_in(r2.url, r2.text):
         # موفق!
         user_sessions[username] = {
             "session": session,
             "hidden": {},
             "password": pwd
         }
+        debug['login_success'] = True
+        
+        # تلاش برای گرفتن منو
         menus = get_all_menus(session)
-        return jsonify({"ok": True, "menus": menus, "debug": debug})
+        
+        if menus:
+            return jsonify({"ok": True, "menus": menus, "debug": debug})
+        else:
+            # لاگین موفق اما منو خالی - احتمالاً باید رمز عوض شود
+            debug['warning'] = 'Login successful but redirected to password change. No menus available.'
+            debug['redirect_url'] = r2.url
+            return jsonify({
+                "ok": True, 
+                "menus": [], 
+                "debug": debug,
+                "message": "Login successful but you may need to change your password via web browser first."
+            })
     else:
         # شکست - احتمالاً کپچا اشتباه
         debug['head_snippet'] = r2.text[:1000]
@@ -270,8 +307,9 @@ def solve_captcha():
                 debug['new_captcha_img'] = fetch_captcha_image(session, captcha_check["img_src"])
             # به‌روزرسانی hidden fields
             user_sessions[username]["hidden"] = get_hidden_fields(r2.text)
+            return jsonify({"ok": False, "reason": "captcha_wrong", "debug": debug}), 200
         
-        return jsonify({"ok": False, "reason": "captcha_wrong_or_login_failed", "debug": debug}), 200
+        return jsonify({"ok": False, "reason": "login_failed", "debug": debug}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
