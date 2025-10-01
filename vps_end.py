@@ -11,8 +11,8 @@ BASE = "https://self.birjandut.ac.ir"
 LOGIN_URL = BASE + "/Login.aspx"
 RESERVE_URL = BASE + "/Reservation/Reservation.aspx"
 
-# نگهداری سشن لاگین‌شده به‌ازای یوزرنیم
-user_sessions = {}  # username -> requests.Session()
+# نگهداری session و hidden fields به‌ازای username
+user_sessions = {}  # username -> {"session": Session(), "hidden": {}, "password": ""}
 
 def get_hidden_fields(html):
     soup = BeautifulSoup(html, "html.parser")
@@ -34,12 +34,20 @@ def find_captcha_info(html):
     captcha_input = soup.find("input", {"name": "txtCaptcha"})
     if not captcha_input:
         return None
-    # تلاش برای یافتن تگ img مرتبط (انواع احتمالی)
+    # تلاش برای یافتن تگ img مرتبط
     img = None
-    # نمونه: <img id="imgCaptcha" src="...">
     img = soup.find("img", id=lambda x: x and "captcha" in x.lower()) or \
-          soup.find("img", src=lambda x: x and "captcha" in x.lower()) or \
-          soup.find("img")
+          soup.find("img", src=lambda x: x and "captcha" in x.lower())
+    
+    # اگر img پیدا نشد، همه img ها را چک کن
+    if not img:
+        for potential_img in soup.find_all("img"):
+            if potential_img.has_attr("src"):
+                src = potential_img["src"].lower()
+                if "captcha" in src or "botdetect" in src:
+                    img = potential_img
+                    break
+    
     if img and img.has_attr("src"):
         return {"has_captcha": True, "img_src": img["src"]}
     return {"has_captcha": True, "img_src": None}
@@ -53,8 +61,21 @@ def fetch_captcha_image(session, img_src):
         if r.status_code == 200:
             data = r.content
             b64 = base64.b64encode(data).decode('ascii')
-            return "data:{};base64,{}".format(r.headers.get("Content-Type","image/png"), b64)
+            # تشخیص نوع تصویر از content-type یا داده
+            content_type = r.headers.get("Content-Type", "")
+            if not content_type or content_type == "application/octet-stream":
+                # تلاش برای تشخیص از magic bytes
+                if data[:4] == b'\x89PNG':
+                    content_type = "image/png"
+                elif data[:3] == b'GIF':
+                    content_type = "image/gif"
+                elif data[:2] == b'\xff\xd8':
+                    content_type = "image/jpeg"
+                else:
+                    content_type = "image/png"  # پیش‌فرض
+            return "data:{};base64,{}".format(content_type, b64)
     except Exception as e:
+        print(f"Error fetching captcha: {e}")
         return None
     return None
 
@@ -62,6 +83,7 @@ def attempt_login(username, password):
     session = requests.Session()
     session.trust_env = False
     debug = {}
+    
     try:
         r = session.get(LOGIN_URL, timeout=15)
     except Exception as e:
@@ -70,19 +92,25 @@ def attempt_login(username, password):
 
     debug['login_get_status'] = r.status_code
     debug['login_get_url'] = r.url
-    debug['login_get_head_snippet'] = r.text[:800]
 
     hidden = get_hidden_fields(r.text)
     captcha_info = find_captcha_info(r.text)
     debug['has_captcha'] = bool(captcha_info)
 
-    # اگر کپچا داشته باشیم، سعی می‌کنیم تصویر را بگیریم و بازگردانیم (بدون لاگین)
-    if captcha_info and captcha_info.get("img_src"):
-        img_b64 = fetch_captcha_image(session, captcha_info["img_src"])
-        debug['captcha_img'] = img_b64
-
-    # اگر کپچا هست، اینجا لاگین خودکار را انجام نمی‌دهیم؛ caller باید captcha را ارسال کند.
+    # اگر کپچا داشته باشیم، session و hidden fields را ذخیره کن
     if captcha_info:
+        img_b64 = None
+        if captcha_info.get("img_src"):
+            img_b64 = fetch_captcha_image(session, captcha_info["img_src"])
+            debug['captcha_img'] = img_b64
+            debug['captcha_src'] = captcha_info["img_src"]
+        
+        # ذخیره session، hidden fields و password برای استفاده بعدی
+        user_sessions[username] = {
+            "session": session,
+            "hidden": hidden,
+            "password": password
+        }
         return session, debug
 
     # بدون کپچا --> تلاش به لاگین معمولی
@@ -91,6 +119,7 @@ def attempt_login(username, password):
                "txtPassword": password,
                "txtCaptcha": "",
                "btnLogin": "ورود"}
+    
     try:
         r2 = session.post(LOGIN_URL, data=payload, allow_redirects=True, timeout=15)
     except Exception as e:
@@ -99,21 +128,30 @@ def attempt_login(username, password):
 
     debug['login_post_status'] = r2.status_code
     debug['login_post_url'] = r2.url
-    debug['login_post_head_snippet'] = r2.text[:800]
 
-    # اگر ریدایرکت به Reservation یا صفحه‌ای که منو دارد رخ دهد
     if "Reservation.aspx" in r2.url or "Reservation" in r2.url:
+        # لاگین موفق - ذخیره session
+        user_sessions[username] = {
+            "session": session,
+            "hidden": {},
+            "password": password
+        }
         return session, debug
 
-    # احتمالاً لاگین شکست خورده یا کپچا/صفحه دیگری برگشته
-    # بررسی مجدد وجود captcha پس از POST
+    # چک مجدد کپچا
     captcha_after = find_captcha_info(r2.text)
-    if captcha_after and captcha_after.get("img_src"):
+    if captcha_after:
         debug['has_captcha_after_post'] = True
-        debug['captcha_img_after'] = fetch_captcha_image(session, captcha_after["img_src"])
+        if captcha_after.get("img_src"):
+            debug['captcha_img_after'] = fetch_captcha_image(session, captcha_after["img_src"])
+        # ذخیره hidden fields جدید
+        user_sessions[username] = {
+            "session": session,
+            "hidden": get_hidden_fields(r2.text),
+            "password": password
+        }
         return session, debug
 
-    # در غیر این صورت لاگین ناموفق
     return None, debug
 
 def get_all_menus(session):
@@ -142,71 +180,98 @@ def menu():
     if not username or not password:
         return jsonify({"error": "username & password required"}), 400
 
-    # اگر session از قبل داریم و ظاهراً لاگین است، از آن استفاده کن
+    # چک session موجود
     if username in user_sessions:
-        session = user_sessions[username]
-        menus = get_all_menus(session)
-        if menus:
-            return jsonify({"ok": True, "menus": menus})
-        # اگر session موجود اما منو خالیه، سعی می‌کنیم مجدد login کنیم
-    # تلاش لاگین (یا بررسی کپچا)
+        session_data = user_sessions[username]
+        session = session_data["session"]
+        try:
+            menus = get_all_menus(session)
+            if menus:
+                return jsonify({"ok": True, "menus": menus})
+        except:
+            pass  # session منقضی شده، ادامه به login جدید
+
+    # تلاش لاگین
     session, debug = attempt_login(username, password)
-    # اگر attempt_login فقط session برگرداند ولی کپچا داشت، session برگشته ولی باید کپچا حل شود
+    
     if debug.get('has_captcha') or debug.get('has_captcha_after_post'):
-        # نگهداری session برای ادامه (کاربر باید کپچا را حل کند)
-        user_sessions[username] = session
         return jsonify({"ok": False, "reason": "captcha_required", "debug": debug}), 200
 
     if session is None:
-        # لاگین شکست خورده، debug را برگردان
         return jsonify({"ok": False, "reason": "login_failed", "debug": debug}), 200
 
     # لاگین موفق
-    user_sessions[username] = session
     menus = get_all_menus(session)
     return jsonify({"ok": True, "menus": menus, "debug": debug})
 
 @app.route("/captcha", methods=["POST"])
 def solve_captcha():
     """
-    وقتی سروِر قبلاً کپچا را برگردانده، این endpoint را صدا بزن:
+    حل کپچا با استفاده از session و hidden fields ذخیره‌شده
     payload JSON:
-    { "username": "xxx", "captcha_answer": "abcd" }
+    { "username": "xxx", "password": "xxx", "captcha_answer": "abcd" }
     """
     data = request.get_json() or {}
     username = data.get("username")
+    password = data.get("password")
     captcha_answer = data.get("captcha_answer")
+    
     if not username or not captcha_answer:
         return jsonify({"error": "username & captcha_answer required"}), 400
+    
     if username not in user_sessions:
-        return jsonify({"error": "no session for this user; start /menu first to get captcha"}), 400
+        return jsonify({"error": "no session for this user; call /menu first to get captcha"}), 400
 
-    session = user_sessions[username]
-    # دوباره GET login page تا hidden fields بگیریم
-    r = session.get(LOGIN_URL, timeout=15)
-    hidden = get_hidden_fields(r.text)
-    # لازم است password را (یا ذخیره کرده باشیم) داشته باشیم؛ برای امنیت نگه نداشتیم.
-    # این تابع فرض می‌کند رمز را در same user_sessions ذخیره کرده‌ایم یا کاربر قبلاً آن را فرستاده.
-    # اگر رمز نگهداری نشده، خطا می‌دیم.
-    # (توصیه: این مثال برای تست است. در تولید، رمز را امن ذخیره کن.)
-    pwd = request.args.get("password") or data.get("password")
+    session_data = user_sessions[username]
+    session = session_data["session"]
+    hidden = session_data["hidden"]
+    saved_password = session_data["password"]
+    
+    # استفاده از password ذخیره‌شده یا password جدید
+    pwd = password if password else saved_password
     if not pwd:
-        return jsonify({"error": "password required in this request to complete login"}), 400
+        return jsonify({"error": "password required"}), 400
 
+    # استفاده از hidden fields ذخیره‌شده (همان صفحه‌ای که کپچا از آن آمده)
     payload = {**hidden,
                "txtUsername": username,
                "txtPassword": pwd,
                "txtCaptcha": captcha_answer,
                "btnLogin": "ورود"}
-    r2 = session.post(LOGIN_URL, data=payload, allow_redirects=True, timeout=15)
-    debug = {"post_status": r2.status_code, "post_url": r2.url}
+    
+    try:
+        r2 = session.post(LOGIN_URL, data=payload, allow_redirects=True, timeout=15)
+    except Exception as e:
+        return jsonify({"ok": False, "reason": f"POST failed: {e}"}), 500
+    
+    debug = {
+        "post_status": r2.status_code,
+        "post_url": r2.url,
+        "final_url": r2.url
+    }
+    
     if "Reservation.aspx" in r2.url or "Reservation" in r2.url:
+        # موفق!
+        user_sessions[username] = {
+            "session": session,
+            "hidden": {},
+            "password": pwd
+        }
         menus = get_all_menus(session)
         return jsonify({"ok": True, "menus": menus, "debug": debug})
     else:
-        debug['head_snippet'] = r2.text[:800]
+        # شکست - احتمالاً کپچا اشتباه
+        debug['head_snippet'] = r2.text[:1000]
+        # چک کنیم کپچای جدید هست یا نه
+        captcha_check = find_captcha_info(r2.text)
+        if captcha_check:
+            debug['new_captcha_detected'] = True
+            if captcha_check.get("img_src"):
+                debug['new_captcha_img'] = fetch_captcha_image(session, captcha_check["img_src"])
+            # به‌روزرسانی hidden fields
+            user_sessions[username]["hidden"] = get_hidden_fields(r2.text)
+        
         return jsonify({"ok": False, "reason": "captcha_wrong_or_login_failed", "debug": debug}), 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000")
-
+    app.run(host="0.0.0.0", port=5000)
